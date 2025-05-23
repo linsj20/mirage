@@ -140,6 +140,7 @@ void KernelGraphGenerator::generate_next_operator(
           }
 
           KNOperator *new_op = create_op(*c.kn_graph, op_type, input_tensors);
+
           if (new_op) {
             c.kn_graph->operators.push_back(new_op);
             if (check_range(init_ranges, target_ranges, *c.kn_graph)) {
@@ -351,6 +352,7 @@ void KernelGraphGenerator::generate_next_operator(
 
         TBOperator *last_op = c.tb_graph->operators.back();
         TBOperator *new_op = create_op(*c.tb_graph, op_type, input_tensors);
+
         if (!new_op) {
           continue;
         }
@@ -379,10 +381,10 @@ void KernelGraphGenerator::generate_kernel_graphs() {
   c.kn_graph = std::make_shared<kernel::Graph>();
 
   for (auto const &input_attr : computation_graph_input_attrs) {
-    auto [dim, data_type, layout, strides] = input_attr;
+    auto [dim, data_type, layout, strides, input_map] = input_attr;
     // FIXME: remove the layout attr since we use the strides
     // to describe the layout
-    c.kn_graph->new_input(dim, strides, data_type, layout);
+    c.kn_graph->new_input(dim, strides, input_map, data_type, layout);
   }
 
   std::vector<SerializedSearchContext> verified;
@@ -426,7 +428,8 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
           {to_vector(op->output_tensors[0].num_dims, op->output_tensors[0].dim),
            op->output_tensors[0].data_type,
            op->output_tensors[0].layout,
-           static_cast<kernel::KNInputOp *>(op)->input_strides});
+           static_cast<kernel::KNInputOp *>(op)->input_strides,
+           static_cast<kernel::KNInputOp *>(op)->input_map});
     }
   }
 

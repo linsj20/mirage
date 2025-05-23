@@ -15,6 +15,7 @@
 
 #include "mirage/transpiler/transpile.h"
 #include "mirage/kernel/graph.h"
+#include "mirage/kernel/all_reduce.h"
 #include "mirage/threadblock/graph.h"
 #include "mirage/transpiler/transpiler.h"
 #include <cassert>
@@ -44,6 +45,7 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
   // We need to construct a new kernel graph by decomposing forloop accumulators
   // into the non-reduction accumulator type to enable transpiler optimizations
   g = std::make_shared<kernel::Graph>();
+  g->gpu_dim = _graph->gpu_dim;
   std::unordered_map<size_t, kernel::DTensor> dtensor_mapping;
 
   int input_dtensor_idx = 0;
@@ -67,8 +69,11 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
         // defined in mugraph
         assert(input_dtensor_idx < (int)input_strides.size());
         assert(input_op->input_strides == input_strides[input_dtensor_idx++]);
-        kernel::DTensor dt = g->new_input(
-            dims, input_op->input_strides, dtensor.data_type, dtensor.layout);
+        kernel::DTensor dt = g->new_input_from_constructed(dims,
+                                          input_op->input_strides,
+                                          input_op->input_map,
+                                          dtensor.data_type,
+                                          dtensor.layout);
         dtensor_mapping[op->output_tensors[0].guid] = dt;
         break;
       }
@@ -98,7 +103,10 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
       case KN_EXP_OP:
       case KN_SQUARE_OP:
       case KN_SQRT_OP:
-      case KN_SILU_OP: {
+      case KN_SILU_OP:
+      case KN_GELU_OP:
+      case KN_RELU_OP:
+      case KN_CLAMP_OP: {
         assert(dtensor_inputs.size() == 1);
         assert(op->output_tensors.size() == 1);
         kernel::DTensor dt = g->elementunary(dtensor_inputs[0], op->op_type);
@@ -125,6 +133,15 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
         assert(false && "To be implemented");
         break;
       }
+      case KN_ALLREDUCE_OP: {
+        kernel::KNAllReduceOp *allreduce_op = static_cast<kernel::KNAllReduceOp *>(op);
+        assert(dtensor_inputs.size() == 1);
+        assert(allreduce_op->output_tensors.size() == 1);
+        kernel::DTensor dt =
+            g->all_reduce(dtensor_inputs[0], allreduce_op->inplace);
+        dtensor_mapping[allreduce_op->output_tensors[0].guid] = dt;
+        break;
+      }
       case KN_CUSTOMIZED_OP: {
         // Create a new threadblock graph
         kernel::KNCustomizedOp *customized_op =
@@ -134,7 +151,9 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
                 customized_op->bgraph.grid_dim,
                 customized_op->bgraph.block_dim,
                 customized_op->bgraph.forloop_range,
-                customized_op->bgraph.reduction_dimx);
+                customized_op->bgraph.reduction_dimx,
+                customized_op->bgraph.gpu_dim,
+                true);
         std::unordered_map<size_t, threadblock::STensor> stensor_mapping;
         for (auto const &bop : customized_op->bgraph.operators) {
           // Preparing dtensors in the new graph
@@ -148,11 +167,24 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
               threadblock::TBInputOp *input_op =
                   static_cast<threadblock::TBInputOp *>(bop);
               assert(bop->input_tensors.size() == 0);
+              auto current_dtensor = get_tensor_in_new_graph(dtensor_mapping, input_op->dtensor);
               threadblock::STensor st = tbg->new_input(
-                  get_tensor_in_new_graph(dtensor_mapping, input_op->dtensor),
+                  current_dtensor,
                   input_op->input_map,
                   input_op->forloop_dim,
-                  input_op->output_tensors[0].layout);
+                  input_op->output_tensors[0].layout,
+                  input_op->prologue);
+              
+              // New dtensor for allgather
+              // TODO: Delete this
+              if(input_op->prologue == TB_PROLOGUE_ALLGATHER) {
+                threadblock::TBInputOp *latest_op = 
+                  static_cast<threadblock::TBInputOp *>(tbg->operators.back());
+                kernel::DTensor new_comm_dtensor = latest_op->dtensor;
+                // dtensor_mapping[new_dtensor.guid] = new_dtensor;
+                // Later used in resolve_dtensor_meta
+                all_dtensors.push_back(new_comm_dtensor);
+              }
               stensor_mapping[bop->output_tensors[0].guid] = st;
               break;
             }
@@ -177,6 +209,9 @@ Transpiler::Transpiler(kernel::Graph const *_graph,
             case TB_SQUARE_OP:
             case TB_SQRT_OP:
             case TB_SILU_OP:
+            case TB_GELU_OP:
+            case TB_RELU_OP:
+            case TB_CLAMP_OP:
             case TB_MUL_SCALAR_OP: {
               assert(stensor_inputs.size() == 1);
               threadblock::STensor st =

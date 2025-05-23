@@ -38,16 +38,25 @@ public:
   // input operator
   DTensor new_input(std::vector<int> const &dims,
                     std::vector<size_t> const &strides,
+                    int3 input_map,
                     mirage::type::DataType data_type,
                     mirage::layout::DmemLayout layout);
   DTensor *new_input_ptr(std::vector<int> const &dims,
                          std::vector<size_t> const &strides,
+                         int3 input_map,
                          mirage::type::DataType data_type,
                          mirage::layout::DmemLayout layout);
+  DTensor new_input_from_constructed(std::vector<int> const &dims,
+                    std::vector<size_t> const &strides,
+                    int3 input_map,
+                    mirage::type::DataType data_type,
+                    mirage::layout::DmemLayout layout);                      
   KNOperator *create_input_op(std::vector<int> const &dims,
                               std::vector<size_t> const &strides,
+                              int3 input_map,
                               mirage::type::DataType data_type,
-                              mirage::layout::DmemLayout layout);
+                              mirage::layout::DmemLayout layout,
+                              bool dim_divided = false);
   // output operator
   void mark_output(DTensor const &A);
   void mark_output(DTensor const *A);
@@ -62,12 +71,20 @@ public:
   // elementunary operator
   DTensor exp(DTensor const &input);
   DTensor *exp(DTensor const *input);
-  DTensor silu(DTensor const &input);
-  DTensor *silu(DTensor const *input);
   DTensor square(DTensor const &input);
   DTensor *square(DTensor const *input);
   DTensor sqrt(DTensor const &input);
   DTensor *sqrt(DTensor const *input);
+  DTensor silu(DTensor const &input);
+  DTensor *silu(DTensor const *input);
+  DTensor gelu(DTensor const &input);
+  DTensor *gelu(DTensor const *input);
+  DTensor relu(DTensor const &input);
+  DTensor *relu(DTensor const *input);
+  DTensor
+      clamp(DTensor const &input, float const &min_val, float const &max_val);
+  DTensor *
+      clamp(DTensor const *input, float const &min_val, float const &max_val);
   DTensor elementunary(DTensor const &input,
                        mirage::type::KNOperatorType _type);
   DTensor *elementunary(DTensor const *input,
@@ -75,6 +92,18 @@ public:
 
   KNOperator *create_elementunary_op(DTensor const &input,
                                      mirage::type::KNOperatorType _type);
+
+  DTensor elementunary_clamp(DTensor const &input,
+                             float const &min_val,
+                             float const &max_val);
+  DTensor *elementunary_clamp(DTensor const *input,
+                              float const &min_val,
+                              float const &max_val);
+
+  KNOperator *create_elementunary_clamp_op(DTensor const &input,
+                                           float const &min_val,
+                                           float const &max_val);
+
   // elementunary operator
   DTensor add(DTensor const &input1, DTensor const &input2);
   DTensor mul(DTensor const &input1, DTensor const &input2);
@@ -115,6 +144,11 @@ public:
   DTensor all_reduce(DTensor const &input, bool inplace = true);
   DTensor *all_reduce(DTensor const *input, bool inplace = true);
   KNOperator *create_all_reduce_op(DTensor const &input, bool inplace);
+  // chunk operator
+  std::vector<DTensor> chunk(DTensor const &input, int chunk_size, int dim);
+  int chunk(DTensor const *input, int chunk_size, int dim);
+  KNOperator *create_chunk_op(DTensor const &input, int chunk_size, int dim);
+  // customized operator
   std::vector<DTensor> customized(std::vector<DTensor> const &inputs,
                                   mirage::threadblock::Graph const &_graph);
   int customized(std::vector<DTensor const *> inputs,

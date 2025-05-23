@@ -30,14 +30,32 @@ namespace threadblock {
 
 Graph::Graph()
     : grid_dim(1, 1, 1), block_dim(1, 1, 1), forloop_range(1),
-      reduction_dimx(1), smem_offset(0) {}
+      reduction_dimx(1), smem_offset(0), gpu_dim(1, 1, 1) {}
+
+Graph::Graph(dim3 _grid_dim,
+             dim3 _block_dim,
+             int _forloop_range,
+             int _reduction_dimx,
+             dim3 _gpu_dim,
+             bool _from_constructed)
+    : grid_dim(_grid_dim), block_dim(_block_dim), forloop_range(_forloop_range),
+      reduction_dimx(_reduction_dimx), smem_offset(0), gpu_dim(_gpu_dim),
+      from_constructed(_from_constructed) {
+  // A bgraph cannot have more than MAX_NUM_THREADBLOCKS_PER_KERNEL threadblocks
+  // otherwise we don't have enough buffers in device memory for saving
+  // fingerprints
+  assert(grid_dim.x * grid_dim.y * grid_dim.z <=
+         mirage::config::MAX_NUM_THREADBLOCKS_PER_KERNEL);
+  assert(reduction_dimx > 0);
+}
 
 Graph::Graph(dim3 _grid_dim,
              dim3 _block_dim,
              int _forloop_range,
              int _reduction_dimx)
     : grid_dim(_grid_dim), block_dim(_block_dim), forloop_range(_forloop_range),
-      reduction_dimx(_reduction_dimx), smem_offset(0) {
+      reduction_dimx(_reduction_dimx), smem_offset(0), gpu_dim(1, 1, 1),
+      from_constructed(false) {
   // A bgraph cannot have more than MAX_NUM_THREADBLOCKS_PER_KERNEL threadblocks
   // otherwise we don't have enough buffers in device memory for saving
   // fingerprints
@@ -127,6 +145,9 @@ size_t Graph::calculate_shared_memory_usage(TBOperator *new_op) {
       case mirage::type::TB_SQUARE_OP:
       case mirage::type::TB_SQRT_OP:
       case mirage::type::TB_SILU_OP:
+      case mirage::type::TB_GELU_OP:
+      case mirage::type::TB_RELU_OP:
+      case mirage::type::TB_CLAMP_OP:
       case mirage::type::TB_MUL_SCALAR_OP: {
         // inplace optimization for element-wise unary
         break;
@@ -479,9 +500,12 @@ NewKernelParams Graph::get_new_kernel_params(bool fingerprint) const {
         break;
       }
       case mirage::type::TB_EXP_OP:
-      case mirage::type::TB_SILU_OP:
       case mirage::type::TB_SQUARE_OP:
       case mirage::type::TB_SQRT_OP:
+      case mirage::type::TB_SILU_OP:
+      case mirage::type::TB_GELU_OP:
+      case mirage::type::TB_RELU_OP:
+      case mirage::type::TB_CLAMP_OP:
       case mirage::type::TB_MUL_SCALAR_OP: {
         assert(operators[i]->input_tensors.size() == 1);
         assert(operators[i]->output_tensors.size() == 1);
@@ -771,9 +795,12 @@ void from_json(json const &j, Graph &graph) {
         break;
       }
       case type::TBOperatorType::TB_EXP_OP:
-      case type::TBOperatorType::TB_SILU_OP:
       case type::TBOperatorType::TB_SQUARE_OP:
       case type::TBOperatorType::TB_SQRT_OP:
+      case type::TBOperatorType::TB_SILU_OP:
+      case type::TBOperatorType::TB_GELU_OP:
+      case type::TBOperatorType::TB_RELU_OP:
+      case type::TBOperatorType::TB_CLAMP_OP:
       case type::TBOperatorType::TB_MUL_SCALAR_OP: {
         STensor const &output = graph.elementunary(
             get_tensor_from_guid(

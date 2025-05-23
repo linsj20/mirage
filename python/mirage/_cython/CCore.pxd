@@ -33,18 +33,25 @@ cdef extern from "vector_types.h":
 cdef extern from "mirage/type.h" namespace "mirage::type":
     # This must be consistent with mirage/type.h
     cdef enum DataType:
-        DT_INT8 = 900,
-        DT_UINT16 = 910,
-        DT_BFLOAT16 = 920,
-        DT_FLOAT16 = 921,
-        DT_FLOAT32 = 930,
-        DT_DOUBLE = 940,
+        DT_INT4 = 920,
+        DT_FLOAT8 = 930,
+        DT_INT8 = 935,
+        DT_BFLOAT16 = 940,
+        DT_FLOAT16 = 941,
+        DT_UINT16 = 945,
+        DT_FLOAT32 = 950,
+        DT_DOUBLE = 960,
         DT_UNKNOWN = 999,
     cdef enum TBEpilogueType:
         TB_EPILOGUE_NONE = 3100,
         TB_EPILOGUE_ALLREDUCE = 3101,
         TB_EPILOGUE_ALLTOALL = 3102,
+        TB_EPILOGUE_REDUCESCATTER = 3103,
         TB_EPILOGUE_INVALID = 3199,
+    cdef enum TBPrologueType:
+        TB_PROLOGUE_NONE = 3200,
+        TB_PROLOGUE_ALLGATHER = 3201,
+        TB_PROLOGUE_INVALID = 3299,
     cdef enum KNOperatorType:
         KN_UNKOWN = 1000,
         KN_INPUT_OP = 1001,
@@ -54,7 +61,13 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         KN_EXP_OP = 1100,
         KN_SQUARE_OP = 1101,
         KN_SQRT_OP = 1102,
-        KN_SILU_OP = 1103,
+        KN_MUL_SCALAR_OP = 1103,
+        KN_SILU_OP = 1104,
+        KN_SIGMOID_OP = 1105,
+        KN_GELU_OP = 1106,
+        KN_RELU_OP = 1150,
+        KN_CLAMP_OP = 1151,
+        KN_LOG_OP = 1160,
         # ElementBinary
         KN_ADD_OP = 1200,
         KN_MUL_OP = 1201,
@@ -64,8 +77,19 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         KN_REDUCTION_1_OP = 1301,
         KN_REDUCTION_2_OP = 1302,
         KN_RMS_NORM_OP = 1350,
+        # Concat & Split
+        KN_CONCAT_FIRST_OP_ID = 1400,
+        KN_CONCAT_0_OP = 1400,
+        KN_CONCAT_1_OP = 1401,
+        KN_CONCAT_2_OP = 1402,
+        KN_CONCAT_LAST_OP_ID = 1409,
+        KN_SPLIT_FIRST_OP_ID = 1420,
+        KN_SPLIT_0_OP = 1420,
+        KN_SPLIT_1_OP = 1421,
+        KN_SPLIT_2_OP = 1422,
+        KN_SPLIT_LAST_OP_ID = 1429,
         # Communication
-        KN_ALLREDUCE_OP = 1400,
+        KN_ALLREDUCE_OP = 1900,
         KN_CUSTOMIZED_OP = 1999,
     cdef enum TBOperatorType:
         TB_UNKOWN = 2000,
@@ -76,8 +100,13 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         TB_EXP_OP = 2100,
         TB_SQUARE_OP = 2101,
         TB_SQRT_OP = 2102,
-        TB_SILU_OP = 2103,
-        TB_MUL_SCALAR_OP = 2104,
+        TB_MUL_SCALAR_OP = 2103,
+        TB_SILU_OP = 2104,
+        TB_SIGMOID_OP = 2105,
+        TB_GELU_OP = 2106,
+        TB_RELU_OP = 2150,
+        TB_CLAMP_OP = 2151,
+        TB_LOG_OP = 2160,
         # ElementBinary
         TB_ADD_OP = 2200,
         TB_MUL_OP = 2201,
@@ -97,8 +126,13 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         TB_CONCAT_0_OP = 2400,
         TB_CONCAT_1_OP = 2401,
         TB_CONCAT_2_OP = 2402,
-        TB_CONCAT_LAST_OP_ID = 2410,
+        TB_CONCAT_LAST_OP_ID = 2409,
         TB_CONCAT_THEN_MATMUL_OP = 2411,
+        TB_SPLIT_FIRST_OP_ID = 2420,
+        TB_SPLIT_0_OP = 2420,
+        TB_SPLIT_1_OP = 2421,
+        TB_SPLIT_2_OP = 2422,
+        TB_SPLIT_LAST_OP_ID = 2429,
         # Forloop Accum
         # LD indicates last dimension
         TB_FORLOOP_ACCUM_FIRST_OP = 2500,
@@ -148,9 +182,10 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         void get_bgraph(CppTBGraph** bgraph)
 
     cdef cppclass CppKNGraph "mirage::kernel::Graph":
-        CppKNGraph()
+        CppKNGraph(dim3 gpu_dim)
         CppDTensor* new_input_ptr(vector[int] dims,
                                   vector[size_t] strides,
+                                  int3 input_map,
                                   DataType data_type,
                                   DmemLayout layout)
         void mark_output(const CppDTensor* A, vector[size_t] strides)
@@ -159,9 +194,13 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         CppDTensor* rms_norm(const CppDTensor* input, vector[int])
         CppDTensor* exp(const CppDTensor* input)
         CppDTensor* silu(const CppDTensor* input)
+        CppDTensor* gelu(const CppDTensor* input)
+        CppDTensor* relu(const CppDTensor* input)
+        CppDTensor* clamp(const CppDTensor* input, float min_val, float max_val)
         CppDTensor* add(const CppDTensor* op1, const CppDTensor* op2)
         CppDTensor* mul(const CppDTensor* op1, const CppDTensor* op2)
         CppDTensor* div(const CppDTensor* op1, const CppDTensor* op2)
+        CppDTensor* all_reduce(const CppDTensor* input, bool inplace)
         int customized(vector[const CppDTensor*] inputs,
                        CppDTensor** outputs,
                        CppTBGraph* bgraph)
@@ -170,6 +209,7 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         void generate_triton_program(const char *filepath)
         void generate_cuda_program(const char *filepath)
         vector[CppKNOperator*] operators
+        dim3 gpu_dim
 
 cdef extern from "mirage/threadblock/graph.h" namespace "mirage::threadblock":
     ctypedef struct CppSTensor "mirage::threadblock::STensor":
@@ -206,7 +246,8 @@ cdef extern from "mirage/threadblock/graph.h" namespace "mirage::threadblock":
         CppSTensor* new_input(const CppDTensor* dtensor,
                            int3 input_map,
                            int forloop_dim,
-                           SmemLayout layout)
+                           SmemLayout layout,
+                           TBPrologueType prologue)
         CppDTensor* new_output(const CppSTensor* stensor,
                             int3 output_map,
                             int forloop_dim,
@@ -215,6 +256,9 @@ cdef extern from "mirage/threadblock/graph.h" namespace "mirage::threadblock":
                         const CppSTensor *B)
         CppSTensor* exp(const CppSTensor *A)
         CppSTensor* silu(const CppSTensor *A)
+        CppSTensor* gelu(const CppSTensor *A)
+        CppSTensor* relu(const CppSTensor *A)
+        CppSTensor* clamp(const CppSTensor *A, float min_val, float max_val)
         CppSTensor* square(const CppSTensor *A)
         CppSTensor* sqrt(const CppSTensor *A)
         CppSTensor* add(const CppSTensor *A,

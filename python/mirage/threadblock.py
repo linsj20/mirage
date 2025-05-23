@@ -3,12 +3,17 @@ from .core import *
 class TBGraph:
     def __init__(self, graph):
         self.cygraph = graph
+        self.use_nvshmem = False
 
-    def new_input(self, dtensor: DTensor, input_map: tuple, forloop_dim: int):
-        return self.cygraph.new_input(dtensor, input_map, forloop_dim)
+    def new_input(self, dtensor: DTensor, input_map: tuple, forloop_dim: int, prologue: str = None):
+        if prologue == "allgather":
+            self.use_nvshmem = True
+        return self.cygraph.new_input(dtensor, input_map, forloop_dim, prologue)
 
-    def new_output(self, stensor: STensor, output_map: tuple, forloop_dim: int = -1):
-        return self.cygraph.new_output(stensor, output_map, forloop_dim)
+    def new_output(self, stensor: STensor, output_map: tuple, forloop_dim: int = -1, epilogue: str = None):
+        if epilogue == "allreduce" or epilogue == "alltoall" or epilogue == "reduce_scatter":
+            self.use_nvshmem = True
+        return self.cygraph.new_output(stensor, output_map, forloop_dim, epilogue)
 
     def matmul(self, A: STensor, B: STensor):
         return self.cygraph.matmul(A, B)
@@ -18,6 +23,15 @@ class TBGraph:
 
     def silu(self, A: STensor):
         return self.cygraph.silu(A)
+
+    def gelu(self, A: STensor):
+        return self.cygraph.gelu(A)
+
+    def relu(self, A: STensor):
+        return self.cygraph.relu(A)
+
+    def clamp(self, A: STensor, min_val: float, max_val: float):
+        return self.cygraph.clamp(A, min_val, max_val)
 
     def square(self, A: STensor):
         return self.cygraph.square(A)

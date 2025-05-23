@@ -161,14 +161,20 @@ static string get_tb_op_str(type::TBOperatorType type) {
     switch (type) {
       case type::TB_EXP_OP:
         return "EXP";
-      case type::TB_SILU_OP:
-        return "SILU";
       case type::TB_SQUARE_OP:
         return "SQUARE";
       case type::TB_SQRT_OP:
         return "SQRT";
       case type::TB_MUL_SCALAR_OP:
         return "MULSCALAR";
+      case type::TB_SILU_OP:
+        return "SILU";
+      case type::TB_GELU_OP:
+        return "GELU";
+      case type::TB_RELU_OP:
+        return "RELU";
+      case type::TB_CLAMP_OP:
+        return "CLAMP";
       default:
         assert(0);
     }
@@ -198,21 +204,87 @@ CustomOPTranspileResult
   int cur_custom_kernel_idx = custom_kernel_idx_counter++;
   string func_name = fmt("custom_kernel_$", cur_custom_kernel_idx);
 
+  vector<string> nvshmem_as_param;
+  for(tb::TBOperator const *tb_op : g.operators) {
+    if (tb_op->op_type == type::TB_INPUT_OP) {
+      tb::TBInputOp const *input_op = dynamic_cast<tb::TBInputOp const *>(tb_op);
+      if (input_op->prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER) {
+        nvshmem_as_param.push_back(fmt("uint64_t* __restrict__ allgather_signal_$", 
+                                     input_op->dtensor.guid));
+      }
+    }
+    else if (tb_op->op_type == type::TB_OUTPUT_OP) {
+      tb::TBOutputOp const *output_op = dynamic_cast<tb::TBOutputOp const *>(tb_op);
+      if (output_op->epilogue == type::TBEpilogueType::TB_EPILOGUE_ALLTOALL) {
+        nvshmem_as_param.push_back(fmt("$ const* __restrict__ alltoall_buf_$", 
+                                     get_datatype_str(output_op->dtensor.data_type), 
+                                     output_op->dtensor.guid));
+      } else if (output_op->epilogue == type::TBEpilogueType::TB_EPILOGUE_REDUCESCATTER) {
+        nvshmem_as_param.push_back(fmt("$ * __restrict__ reduce_scatter_buf_$", 
+                                     get_datatype_str(output_op->dtensor.data_type), 
+                                     output_op->dtensor.guid));
+      }
+    }
+  }
+
   // Generate code prologue
   CodeKeeper code;
-  code.e(
-      "__global__ void __launch_bounds__($) $($, $) {",
-      num_threads,
-      func_name,
-      map<kn::DTensor, string>(op->output_tensors,
-                               [](kn::DTensor const &dtensor) -> string {
-                                 return fmt("half_t* __restrict__ dtensor$_ptr",
+  if (use_nvshmem) {
+    if (!nvshmem_as_param.empty()) {
+      code.e("__global__ void __launch_bounds__($) $($, $, $, int mype, int npes) {",
+            num_threads,
+            func_name,
+            map<kn::DTensor, string>(op->output_tensors,
+                                      [](kn::DTensor const &dtensor) -> string {
+                                        return fmt(
+                                            "$* __restrict__ dtensor$_ptr",
+                                            get_datatype_str(dtensor.data_type),
                                             dtensor.guid);
-                               }),
-      map<kn::DTensor, string>(
-          op->input_tensors, [](kn::DTensor const &dtensor) -> string {
-            return fmt("half_t const* __restrict__ dtensor$_ptr", dtensor.guid);
-          }));
+                                      }),
+            map<kn::DTensor, string>(
+                op->input_tensors, [](kn::DTensor const &dtensor) -> string {
+                  return fmt("$ const* __restrict__ dtensor$_ptr",
+                              get_datatype_str(dtensor.data_type),
+                              dtensor.guid);
+                }),
+            nvshmem_as_param);
+    } else {
+        code.e("__global__ void __launch_bounds__($) $($, $, int mype, int npes) {",
+            num_threads,
+            func_name,
+            map<kn::DTensor, string>(op->output_tensors,
+                                      [](kn::DTensor const &dtensor) -> string {
+                                        return fmt(
+                                            "$* __restrict__ dtensor$_ptr",
+                                            get_datatype_str(dtensor.data_type),
+                                            dtensor.guid);
+                                      }),
+            map<kn::DTensor, string>(
+                op->input_tensors, [](kn::DTensor const &dtensor) -> string {
+                  return fmt("$ const* __restrict__ dtensor$_ptr",
+                              get_datatype_str(dtensor.data_type),
+                              dtensor.guid);
+                }));
+    }
+  } 
+  else {
+    code.e("__global__ void __launch_bounds__($) $($, $) {" ,
+           num_threads,
+           func_name,
+           map<kn::DTensor, string>(op->output_tensors,
+                                    [](kn::DTensor const &dtensor) -> string {
+                                      return fmt(
+                                          "$* __restrict__ dtensor$_ptr",
+                                          get_datatype_str(dtensor.data_type),
+                                          dtensor.guid);
+                                    }),
+           map<kn::DTensor, string>(
+               op->input_tensors, [](kn::DTensor const &dtensor) -> string {
+                 return fmt("$ const* __restrict__ dtensor$_ptr",
+                            get_datatype_str(dtensor.data_type),
+                            dtensor.guid);
+               }));
+  }
 
   // Define thread idx
   string thread_idx;
@@ -230,7 +302,11 @@ CustomOPTranspileResult
   code.e("// STensors");
   code.e("extern __shared__ char buf[];");
   for (auto [guid, addr] : mem_plan.addrs) {
-    code.e("half_t *stensor$_ptr = (half_t*)(buf + $);", guid, addr);
+    code.e("$ *stensor$_ptr = ($*)(buf + $);",
+           get_datatype_str(op->input_tensors[0].data_type),
+           guid,
+           get_datatype_str(op->input_tensors[0].data_type),
+           addr);
   }
   // Erase the lowest 16 bytes to 0 for GEMM
   code.e("*((uint128_t*)buf) = 0ul;");
@@ -256,8 +332,9 @@ CustomOPTranspileResult
       assert(dtensor.num_dims == stensor.num_dims);
       assert(dtensor.data_type == stensor.data_type);
 
+      int64_t ptr_name_guid = (dtensor.prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER ? dtensor.original_guid : dtensor.guid);
       code.e("// Copy for G->S: dtensor $ -> stensor $",
-             dtensor.guid,
+             ptr_name_guid,
              stensor.guid);
 
       // Get the starting address of my tile
@@ -279,10 +356,10 @@ CustomOPTranspileResult
                         dtensor_meta.strides[div_dim]);
         }
       }
-
-      code.e("const half_t *dtensor$_tile_ptr = dtensor$_ptr $;",
-             dtensor.guid,
-             dtensor.guid,
+      code.e("const $ *dtensor$_tile_ptr = dtensor$_ptr $;",
+             get_datatype_str(dtensor.data_type),
+             ptr_name_guid,
+             ptr_name_guid,
              offset);
 
       bool use_chunked_copy = op_meta.is_chunked_input;
@@ -297,37 +374,41 @@ CustomOPTranspileResult
         string dtensor_tile_layout = get_dtensor_tile_layout(
             dtensor, dtensor_meta, stensor, stensor_meta, d_innermost_dim);
         code.e(
-            "using DTensor$TileLayout = $;", dtensor.guid, dtensor_tile_layout);
+            "using DTensor$TileLayout = $;", ptr_name_guid, dtensor_tile_layout);
         // Non-chunked, synchronous copy
         code.e(
-            "using STensor$InputAtom = tb::InputNonChunkedSyncCopy<half_t, "
+            "using STensor$InputAtom = tb::InputNonChunkedSyncCopy<$, "
             "$, DTensor$TileLayout, NUM_THREADS>;",
             stensor.guid,
+            get_datatype_str(stensor.data_type),
             mov_last_get_stensor_layout(stensor, stensor_meta, d_innermost_dim),
-            dtensor.guid);
+            ptr_name_guid);
       } else {
         string dtensor_tile_layout = get_dtensor_tile_layout(
             dtensor, dtensor_meta, stensor, stensor_meta, real_innermost_dim);
         code.e(
-            "using DTensor$TileLayout = $;", dtensor.guid, dtensor_tile_layout);
+            "using DTensor$TileLayout = $;", ptr_name_guid, dtensor_tile_layout);
         if (!use_async_copy) {
           // Chunked, synchronous copy
-          code.e("using STensor$InputAtom = tb::InputChunkedSyncCopy<half_t, "
+          code.e("using STensor$InputAtom = tb::InputChunkedSyncCopy<$, "
                  "$, DTensor$TileLayout, NUM_THREADS>;",
                  stensor.guid,
+                 get_datatype_str(stensor.data_type),
                  mov_last_get_stensor_layout(
                      stensor, stensor_meta, real_innermost_dim),
-                 dtensor.guid);
+                 ptr_name_guid);
         } else {
           // Chunked, asynchronous copy
           pipelined_input_ops.insert(cur_op);
-          code.e("using STensor$InputAtom = tb::InputChunkedAsyncCopy<half_t, "
+          code.e("using STensor$InputAtom = tb::InputChunkedAsyncCopy<$, "
                  "$, DTensor$TileLayout, NUM_THREADS>;",
                  stensor.guid,
+                 get_datatype_str(stensor.data_type),
                  mov_last_get_stensor_layout(
                      stensor, stensor_meta, real_innermost_dim),
-                 dtensor.guid);
-          code.e("half_t *stensor$_async_copy_buf = stensor$_ptr;",
+                 ptr_name_guid);
+          code.e("$ *stensor$_async_copy_buf = stensor$_ptr;",
+                 get_datatype_str(stensor.data_type),
                  stensor.guid,
                  stensor.guid + mem_plan.pipelined_input_buf_guid_offset);
         }
@@ -352,12 +433,13 @@ CustomOPTranspileResult
         cur_op)); // An input op in pre_loop_nodes should not be software
                   // pipelined since they do not have forloop_dim
     num_pre_loop_copies += 1;
+    int64_t ptr_name_guid = (cur_op->dtensor.prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER ? cur_op->dtensor.original_guid : cur_op->dtensor.guid);
     code.e("STensor$InputAtom::run(stensor$_ptr, "
            "dtensor$_tile_ptr, "
            "thread_idx);",
            stensor.guid,
            stensor.guid,
-           cur_op->dtensor.guid);
+           ptr_name_guid);
   }
   code.e("");
 
@@ -392,17 +474,33 @@ CustomOPTranspileResult
         int num_tbs = dim == 0   ? g.grid_dim.x
                       : dim == 1 ? g.grid_dim.y
                                  : g.grid_dim.z;
+        type::TBEpilogueType type = cur_op->epilogue;
+        // TODO
+        int reduce_scatter_divide_dim = 1; // y dim
         if (num_tbs > 1) {
-          // The output tensor MUST be divided along this dimension, as stated
-          // in the paper
           assert(div_dim >= 0);
-          offset += fmt(" + blockIdx.$*$*$",
-                        (char)"xyz"[dim],
-                        dtensor.dim[div_dim] / num_tbs,
-                        dtensor_meta.strides[div_dim]);
+          if (dim == reduce_scatter_divide_dim && 
+              type == type::TBEpilogueType::TB_EPILOGUE_REDUCESCATTER) {
+            // The output tensor MUST be divided along this dimension, as stated
+            // in the paper
+            int num_gpus = g.gpu_dim.x;
+            offset += fmt(" + blockIdx.$*$*$",
+                          (char)"xyz"[dim],
+                          dtensor.dim[div_dim] / num_tbs * num_gpus,
+                          dtensor_meta.strides[div_dim]);
+          } else {
+            // The output tensor MUST be divided along this dimension, as stated
+            // in the paper
+            offset += fmt(" + blockIdx.$*$*$",
+                          (char)"xyz"[dim],
+                          dtensor.dim[div_dim] / num_tbs,
+                          dtensor_meta.strides[div_dim]);
+          }
         }
+
       }
-      code.e("half_t *dtensor$_tile_ptr = dtensor$_ptr $;",
+      code.e("$ *dtensor$_tile_ptr = dtensor$_ptr $;",
+             get_datatype_str(dtensor.data_type),
              dtensor.guid,
              dtensor.guid,
              offset);
@@ -416,21 +514,22 @@ CustomOPTranspileResult
             dtensor, dtensor_meta, stensor, stensor_meta, d_innermost_dim);
         code.e(
             "using DTensor$TileLayout = $;", dtensor.guid, dtensor_tile_layout);
-        code.e(
-            "using STensor$OutputAtom = tb::OutputNonChunkedSyncCopy<half_t, "
-            "DTensor$TileLayout, $, NUM_THREADS>;",
-            stensor.guid,
-            dtensor.guid,
-            mov_last_get_stensor_layout(
-                stensor, stensor_meta, d_innermost_dim));
+        code.e("using STensor$OutputAtom = tb::OutputNonChunkedSyncCopy<$, "
+               "DTensor$TileLayout, $, NUM_THREADS>;",
+               stensor.guid,
+               get_datatype_str(stensor.data_type),
+               dtensor.guid,
+               mov_last_get_stensor_layout(
+                   stensor, stensor_meta, d_innermost_dim));
       } else {
         string dtensor_tile_layout = get_dtensor_tile_layout(
             dtensor, dtensor_meta, stensor, stensor_meta, real_innermost_dim);
         code.e(
             "using DTensor$TileLayout = $;", dtensor.guid, dtensor_tile_layout);
-        code.e("using STensor$OutputAtom = tb::OutputChunkedSyncCopy<half_t, "
+        code.e("using STensor$OutputAtom = tb::OutputChunkedSyncCopy<$, "
                "DTensor$TileLayout, $, NUM_THREADS>;",
                stensor.guid,
+               get_datatype_str(stensor.data_type),
                dtensor.guid,
                mov_last_get_stensor_layout(
                    stensor, stensor_meta, real_innermost_dim));
@@ -457,8 +556,9 @@ CustomOPTranspileResult
       for (int i = 0; i < accum.num_dims; ++i) {
         num_elems = std::max(num_elems, accum.dim[i] * accum_meta.strides[i]);
       }
-      code.e("tb::ClearAccumlatorKernel<half_t, $, "
+      code.e("tb::ClearAccumlatorKernel<$, $, "
              "NUM_THREADS>::run(stensor$_ptr, thread_idx);",
+             get_datatype_str(accum.data_type),
              num_elems,
              accum.guid);
       num_clear_accums += 1;
@@ -498,11 +598,15 @@ CustomOPTranspileResult
       int mma_atom_num_threads;
       if (GPU_CC::A100 <= config.target_cc && config.target_cc < GPU_CC::H100) {
         if (k <= 8) {
-          mma_atom_str = "SM80_16x8x8_F16F16F16F16_TN";
+          mma_atom_str = input0.data_type == type::DT_FLOAT16
+                             ? "SM80_16x8x8_F16F16F16F16_TN"
+                             : "SM80_16x8x8_F32BF16BF16F32_TN";
           mma_atom_mnk = {16, 8, 8};
           mma_atom_num_threads = 32;
         } else {
-          mma_atom_str = "SM80_16x8x16_F16F16F16F16_TN";
+          mma_atom_str = input0.data_type == type::DT_FLOAT16
+                             ? "SM80_16x8x16_F16F16F16F16_TN"
+                             : "SM80_16x8x16_F32BF16BF16F32_TN";
           mma_atom_mnk = {16, 8, 16};
           mma_atom_num_threads = 32;
         }
@@ -519,11 +623,14 @@ CustomOPTranspileResult
       assert(num_threads % mma_atom_num_threads == 0);
       int max_num_tgs = num_threads / mma_atom_num_threads; // tg = thread group
       float best_score = -1.0f;
-      int best_num_tg_m = -1, best_num_tg_n = -1;
+      int best_num_tg_m = 1, best_num_tg_n = 1;
       for (int num_tg_m = 1; num_tg_m <= max_num_tgs; ++num_tg_m) {
         for (int num_tg_n = 1; num_tg_m * num_tg_n <= max_num_tgs; ++num_tg_n) {
           int tiled_mma_m = mma_atom_m * num_tg_m;
           int tiled_mma_n = mma_atom_n * num_tg_n;
+          if (tiled_mma_m > m || tiled_mma_n > n) {
+            continue;
+          }
           int num_tiles_m = ceil_div(m, tiled_mma_m);
           int num_tiles_n = ceil_div(n, tiled_mma_n);
           int64_t data_moved_A =
@@ -565,11 +672,12 @@ CustomOPTranspileResult
              output.guid,
              get_stensor_layout(output, meta2, num_dims - 2 /*start_dim*/));
 
-      code.e("using Matmul$Kernel = tb::Matmul<half_t, $, Layout<Shape<Int<$>, "
+      code.e("using Matmul$Kernel = tb::Matmul<$, $, Layout<Shape<Int<$>, "
              "Int<$>, _1>>, $, $, Matmul$LayoutA, Matmul$LayoutB, "
              "Matmul$LayoutC, NUM_THREADS, "
              "$, $>;",
              output.guid,
+             get_datatype_str(input0.data_type),
              mma_atom_str,
              best_num_tg_m,
              best_num_tg_n,
@@ -595,6 +703,27 @@ CustomOPTranspileResult
     code.e("");
   }
 
+  code.e("// Prologue");
+  code.e("{");
+  for (TBSchedNode const &node :
+        Combine(Combine(sched.pre_loop_nodes, sched.loop_nodes),
+                sched.post_loop_nodes)) {
+    if (node.type == tb_sched_node_t::OPERATOR &&
+        node.ops.front().first->op_type == type::TB_INPUT_OP) {
+      tb::TBInputOp const *cur_op = dynamic_cast<tb::TBInputOp const *>(node.ops.front().first);
+      type::TBPrologueType prologue_type = cur_op->prologue;
+      if (prologue_type == type::TBPrologueType::TB_PROLOGUE_ALLGATHER) {
+        code.e("// Allgather prologue waiting");
+          code.e("// Currently sending tile is the whole tensor on each GPU");
+          code.e("int signal_idx = (blockIdx.y * blockDim.y + threadIdx.y) / (gridDim.y / npes);");
+          //TODO: allgather (Jianan)
+          code.e("tb::allgather_signal_wait_until_ne(allgather_signal_$, signal_idx);",
+                 cur_op->dtensor.guid);
+          code.e("");
+        }
+    }
+  }
+  code.e("}");
   // Launch async input operations for all async inputs
   if (!pipelined_input_ops.empty()) {
     code.e("{");
@@ -602,11 +731,12 @@ CustomOPTranspileResult
       kn::DTensor const &dtensor = input_op->dtensor;
       tb::STensor const &output = input_op->output_tensors.at(0);
       assert(input_op->forloop_dim >= 0);
+      int64_t ptr_name_guid = (dtensor.prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER ? dtensor.original_guid : dtensor.guid);
       code.e("STensor$InputAtom::run(stensor$_async_copy_buf, "
              "dtensor$_tile_ptr, thread_idx);",
              output.guid,
              output.guid,
-             dtensor.guid);
+             ptr_name_guid);
     }
     code.e("cute::cp_async_fence();");
     code.e("}");
@@ -618,30 +748,37 @@ CustomOPTranspileResult
   // argument
   auto transpile_fusion_epilogue =
       [&](std::vector<std::pair<tb::TBOperator const *, TBSchedOpMeta>> const
-              &chain) -> string {
+              &chain,
+          string dtype) -> string {
     size_t chain_size = chain.size();
     if (chain_size == 1) {
       // Not fused with anything
-      return "tb::EpilogueStore<half_t>";
+      return fmt("tb::EpilogueStore<$>", dtype);
     }
     // Deal with the last operator
-    string res = "tb::EpilogueStore<half_t>";
+    string res = fmt("tb::EpilogueStore<$>", dtype);
     for (size_t i = chain_size - 1; i >= 1; --i) {
       tb::TBOperator const *cur_op = chain[i].first;
       if (cur_op->op_type == type::TB_FORLOOP_ACCUM_NO_RED_OP) {
         // Can only occur as the last operator in the chain
         assert(i == chain_size - 1);
-        res = "tb::EpilogueStoreAccum<half_t>";
+        res = fmt("tb::EpilogueStoreAccum<$>", dtype);
       } else if (cur_op->op_type == type::TB_EXP_OP) {
-        res = fmt("tb::EpilogueExp<half_t, $>", res);
+        res = fmt("tb::EpilogueExp<$, $>", dtype, res);
       } else if (cur_op->op_type == type::TB_SILU_OP) {
-        res = fmt("tb::EpilogueSILU<half_t, $>", res);
+        res = fmt("tb::EpilogueSILU<$, $>", dtype, res);
+      } else if (cur_op->op_type == type::TB_GELU_OP) {
+        res = fmt("tb::EpilogueGELU<$, $>", dtype, res);
+      } else if (cur_op->op_type == type::TB_RELU_OP) {
+        res = fmt("tb::EpilogueRELU<$, $>", dtype, res);
+      } else if (cur_op->op_type == type::TB_CLAMP_OP) {
+        res = fmt("tb::EpilogueClamp<$, $>", dtype, res);
       } else if (cur_op->op_type == type::TB_SQUARE_OP) {
-        res = fmt("tb::EpilogueSquare<half_t, $>", res);
+        res = fmt("tb::EpilogueSquare<$, $>", dtype, res);
       } else if (cur_op->op_type == type::TB_SQRT_OP) {
-        res = fmt("tb::EpilogueSqrt<half_t, $>", res);
+        res = fmt("tb::EpilogueSqrt<$, $>", dtype, res);
       } else if (cur_op->op_type == type::TB_MUL_SCALAR_OP) {
-        res = fmt("tb::EpilogueMulScalar<half_t, $>", res);
+        res = fmt("tb::EpilogueMulScalar<$, $>", dtype, res);
       } else {
         assert(0 && "Unknown operator type");
       }
@@ -673,16 +810,18 @@ CustomOPTranspileResult
           assert(cur_op->forloop_dim >= 0);
           kn::DTensor const &dtensor = cur_op->dtensor;
           tb::STensor const &output = cur_op->output_tensors.at(0);
+
           int tile_side_len = output.dim[cur_op->forloop_dim];
           size_t forloop_dim_stride =
               dtensor_metas.at(dtensor.guid).strides[cur_op->forloop_dim];
           bool is_async_copy = pipelined_input_ops.count(cur_op);
           assert(!is_async_copy); // Async copies should be proceeded separately
+          int64_t ptr_name_guid = (dtensor.prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER ? dtensor.original_guid : dtensor.guid);
           code.e("STensor$InputAtom::run(stensor$_ptr, dtensor$_tile_ptr + "
                  "$*for_idx, thread_idx);",
                  output.guid,
                  output.guid,
-                 dtensor.guid,
+                 ptr_name_guid,
                  tile_side_len * forloop_dim_stride);
           break;
         }
@@ -710,13 +849,138 @@ CustomOPTranspileResult
                    tile_side_len * forloop_dim_stride);
 #endif
           } else {
+            // tb epilogue communication
+            type::TBEpilogueType epilogue_type = cur_op->epilogue;
+
             tb::STensor const &stensor = cur_op->input_tensors.at(0);
             kn::DTensor const &dtensor = cur_op->dtensor;
+            DTensorMeta dtensor_meta = dtensor_metas.at(dtensor.guid);
+
             code.e("STensor$OutputAtom::run(dtensor$_tile_ptr, stensor$_ptr, "
                    "thread_idx);",
                    stensor.guid,
                    dtensor.guid,
                    stensor.guid);
+
+            int num_elements = 1;
+            for (int i = 0; i < dtensor.num_dims; i++) {
+                num_elements *= dtensor.dim[i];
+            }
+            if (epilogue_type == type::TBEpilogueType::TB_EPILOGUE_ALLREDUCE) {
+              //TODO: TB allreduce
+              code.e("// dtensor.dim[0] = $, dtensor.dim[1] = $, dtensor.dim[2] = $, dtensor.dim[3] = $",
+                    dtensor.dim[0], dtensor.dim[1], dtensor.dim[2], dtensor.dim[3]);
+              code.e("// Perform NVSHMEM allreduce. num_elements = $", num_elements);
+              //code.e("nvshmem_barrier_all();");
+              code.e("nvshmem_half_sum_reduce(NVSHMEM_TEAM_WORLD, reinterpret_cast<half*>(dtensor$_ptr), reinterpret_cast<const half*>(dtensor$_ptr), $);",
+                    dtensor.guid, dtensor.guid, num_elements);
+              //code.e("nvshmem_barrier_all();");
+              // break;
+            }
+            else if (epilogue_type == type::TBEpilogueType::TB_EPILOGUE_ALLTOALL) {
+              //TODO: TB alltoall
+              //TODO: For now we assume: 
+              // 1. only one node 
+              // 2. divide only on the y dim (easy to extend once division dim is accessible)
+              // 3. block size is a factor of dtensor size
+              int all2all_divide_dim = 1; // y dim
+              code.e("// Perform alltoall. num_elements = $", num_elements);
+              //code.e("nvshmem_barrier_all();");
+              code.e("int block_per_p = (gridDim.y + npes - 1) / npes;");
+
+              code.e("int dst_rank = blockIdx.y / block_per_p;");
+              string dst_offset = "";
+              int3 omap = cur_op->output_map;
+              for (int dim = 0; dim < 3; ++dim) {
+                int div_dim = dim == 0 ? omap.x : dim == 1 ? omap.y : omap.z;
+                int num_tbs = dim == 0   ? g.grid_dim.x
+                              : dim == 1 ? g.grid_dim.y
+                                        : g.grid_dim.z;
+                if (num_tbs > 1) {
+                  assert(div_dim >= 0);
+                  if (dim != all2all_divide_dim) {
+                    dst_offset += fmt(" + blockIdx.$*$*$",
+                                  (char)"xyz"[dim],
+                                  dtensor.dim[div_dim] / num_tbs,
+                                  dtensor_meta.strides[div_dim]);
+                  }
+                  else {
+                    dst_offset += fmt(" + (blockIdx.$%block_per_p + mype*block_per_p)*$*$",
+                                  (char)"xyz"[dim],
+                                  dtensor.dim[div_dim] / num_tbs,
+                                  dtensor_meta.strides[div_dim]);
+                  }
+                }
+              }
+
+              //code.e("half_t *recv_ptr = nvshmem_ptr(alltoall_buf_$, dst_rank);", 
+              //       dtensor.guid);
+              code.e("$ *recv_ptr = ($ *)alltoall_buf_$;", 
+                     get_datatype_str(dtensor.data_type),
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              code.e("recv_ptr = recv_ptr $; // dst_offset", dst_offset);
+
+              code.e("$ *send_ptr = dtensor$_tile_ptr;", 
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              
+              code.e("using comm_executor = tb::CommExecutor<$, DTensor$TileLayout, false>;", 
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              code.e("comm_executor::send(recv_ptr, send_ptr, dst_rank, NULL);");
+
+              //code.e("nvshmem_barrier_all();");
+              // break;
+            }
+            else if (epilogue_type == type::TBEpilogueType::TB_EPILOGUE_REDUCESCATTER) {
+              // Copy of alltoall
+              int reduce_scatter_divide_dim = 1; // y dim
+              code.e("// Perform reduce_scatter. num_elements = $", num_elements);
+              code.e("int block_per_p = (gridDim.y + npes - 1) / npes;");
+
+              code.e("int dst_rank = blockIdx.y / block_per_p;");
+              string dst_offset = "";
+              int3 omap = cur_op->output_map;
+              for (int dim = 0; dim < 3; ++dim) {
+                int div_dim = dim == 0 ? omap.x : dim == 1 ? omap.y : omap.z;
+                int num_tbs = dim == 0   ? g.grid_dim.x
+                              : dim == 1 ? g.grid_dim.y
+                                        : g.grid_dim.z;
+                if (num_tbs > 1) {
+                  assert(div_dim >= 0);
+                  if (dim != reduce_scatter_divide_dim) {
+                    dst_offset += fmt(" + blockIdx.$*$*$",
+                                  (char)"xyz"[dim],
+                                  dtensor.dim[div_dim] / num_tbs,
+                                  dtensor_meta.strides[div_dim]);
+                  }
+                  else {
+                    int num_gpus = g.gpu_dim.x;
+                    dst_offset += fmt(" + (blockIdx.$%block_per_p + mype*block_per_p)*$*$",
+                                  (char)"xyz"[dim],
+                                  dtensor.dim[div_dim] / num_tbs * num_gpus,
+                                  dtensor_meta.strides[div_dim]);
+                  }
+                }
+              }
+
+              code.e("$ *recv_ptr = ($ *)reduce_scatter_buf_$;", 
+                     get_datatype_str(dtensor.data_type),
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              code.e("recv_ptr = recv_ptr$; // dst_offset", dst_offset);
+
+              code.e("$ *send_ptr = dtensor$_tile_ptr;", 
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              
+              code.e("tb::CommExecutor<$, DTensor$TileLayout, false> comm_executor;", 
+                     get_datatype_str(dtensor.data_type),
+                     dtensor.guid);
+              code.e("comm_executor.send(recv_ptr, send_ptr, dst_rank, NULL);");
+            }
+            //TODO (linsj20)
           }
           break;
         }
@@ -749,9 +1013,12 @@ CustomOPTranspileResult
           break;
         }
         case type::TB_EXP_OP:
-        case type::TB_SILU_OP:
         case type::TB_SQUARE_OP:
         case type::TB_SQRT_OP:
+        case type::TB_SILU_OP:
+        case type::TB_GELU_OP:
+        case type::TB_RELU_OP:
+        case type::TB_CLAMP_OP:
         case type::TB_MUL_SCALAR_OP: {
           tb::TBElementUnaryOp const *cur_op =
               dynamic_cast<tb::TBElementUnaryOp const *>(op);
@@ -797,11 +1064,13 @@ CustomOPTranspileResult
           code.e("using InLayout = $;", in_layout);
           code.e("using OutLayout = $;", final_out_layout);
           // Get the epilogue
-          string epilogue = transpile_fusion_epilogue(sched_node.ops);
+          string epilogue = transpile_fusion_epilogue(
+              sched_node.ops, get_datatype_str(input.data_type));
           // Define and run the kernel
-          code.e("using Kernel = tb::ElementUnaryKernel<half_t, "
+          code.e("using Kernel = tb::ElementUnaryKernel<$, "
                  "tb::ElementUnaryOpType::$, OutLayout, InLayout, "
                  "NUM_THREADS, $>;",
+                 get_datatype_str(input.data_type),
                  get_tb_op_str(cur_op->op_type),
                  epilogue);
           // add scalar chains for epilogue
@@ -857,11 +1126,13 @@ CustomOPTranspileResult
           code.e("using In1Layout = $;", in1_layout);
           code.e("using OutLayout = $;", final_out_layout);
           // Get the epilogue
-          string epilogue = transpile_fusion_epilogue(sched_node.ops);
+          string epilogue = transpile_fusion_epilogue(
+              sched_node.ops, get_datatype_str(input0.data_type));
           // Define and run the kernel
-          code.e("using Kernel = tb::ElementBinaryKernel<half_t, "
+          code.e("using Kernel = tb::ElementBinaryKernel<$, "
                  "tb::ElementBinaryOpType::$, OutLayout, In0Layout, In1Layout, "
                  "NUM_THREADS, $>;",
+                 get_datatype_str(input0.data_type),
                  op_type_str,
                  epilogue);
           code.e(append_epilogue_scalars(sched_node.ops));
@@ -919,10 +1190,12 @@ CustomOPTranspileResult
           code.e("using InLayout = $;", in_layout);
           code.e("using OutLayout = $;", final_out_layout);
           // Get the epilogue
-          string epilogue = transpile_fusion_epilogue(sched_node.ops);
+          string epilogue = transpile_fusion_epilogue(
+              sched_node.ops, get_datatype_str(input.data_type));
           // Define and run the kernel
-          code.e("using Kernel = tb::ReductionKernel<half_t, "
+          code.e("using Kernel = tb::ReductionKernel<$, "
                  "OutLayout, InLayout, $, NUM_THREADS, $>;",
+                 get_datatype_str(input.data_type),
                  cute_reduc_dim,
                  epilogue);
           code.e(append_epilogue_scalars(sched_node.ops));
@@ -960,8 +1233,9 @@ CustomOPTranspileResult
               input, stensor_metas.at(input.guid), iter_dim);
           string accum_layout = mov_last_get_stensor_layout(
               accum, stensor_metas.at(accum.guid), iter_dim);
-          code.e("using Kernel = tb::ForloopAccumKernel<half_t, $, $, "
+          code.e("using Kernel = tb::ForloopAccumKernel<$, $, $, "
                  "NUM_THREADS>;",
+                 get_datatype_str(input.data_type),
                  accum_layout,
                  in_layout);
           code.e("Kernel::run(stensor$_ptr, stensor$_ptr, thread_idx);",
@@ -1010,11 +1284,12 @@ CustomOPTranspileResult
       int tile_side_len = output.dim[input_op->forloop_dim];
       size_t forloop_dim_stride =
           dtensor_metas.at(dtensor.guid).strides[input_op->forloop_dim];
+      int64_t ptr_name_guid = (dtensor.prologue == type::TBPrologueType::TB_PROLOGUE_ALLGATHER ? dtensor.original_guid : dtensor.guid);
       code.e("STensor$InputAtom::run(stensor$_ptr, dtensor$_tile_ptr + "
              "$*(for_idx+1), thread_idx);",
              output.guid,
              output.guid,
-             dtensor.guid,
+             ptr_name_guid,
              tile_side_len * forloop_dim_stride);
     }
     code.e("}");
@@ -1092,6 +1367,7 @@ CustomOPTranspileResult
       }
     }
   }
+
 
   code.e("}"); // kernel
 

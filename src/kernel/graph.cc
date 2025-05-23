@@ -177,16 +177,18 @@ void from_json(json const &j, Graph &g) {
         type::DataType data_type;
         layout::DmemLayout layout;
         std::vector<size_t> input_strides;
+        int3 input_map;
         size_t guidO;
         jop.at("output_tensors")[0].at("num_dims").get_to(num_dim);
         jop.at("output_tensors")[0].at("dim").get_to(dim);
         jop.at("input_strides").get_to(input_strides);
+        jop.at("input_map").get_to(input_map);
         jop.at("output_tensors")[0].at("data_type").get_to(data_type);
         jop.at("output_tensors")[0].at("layout").get_to(layout);
         jop.at("output_tensors")[0].at("guid").get_to(guidO);
         std::vector<int> dims = to_vector(num_dim, dim);
         DTensor const &output =
-            g.new_input(dims, input_strides, data_type, layout);
+            g.new_input(dims, input_strides, input_map, data_type, layout);
         guid_mapping[output.guid] = guidO;
         break;
       }
@@ -211,12 +213,25 @@ void from_json(json const &j, Graph &g) {
       case type::KNOperatorType::KN_EXP_OP:
       case type::KNOperatorType::KN_SQUARE_OP:
       case type::KNOperatorType::KN_SQRT_OP:
-      case type::KNOperatorType::KN_SILU_OP: {
+      case type::KNOperatorType::KN_SILU_OP:
+      case type::KNOperatorType::KN_GELU_OP:
+      case type::KNOperatorType::KN_RELU_OP: {
         size_t guid, guidO;
         jop.at("input_tensors")[0].at("guid").get_to(guid);
         jop.at("output_tensors")[0].at("guid").get_to(guidO);
         DTensor const &output =
             g.elementunary(get_tensor_from_guid(guid), op_type);
+        guid_mapping[output.guid] = guidO;
+        break;
+      }
+      case type::KNOperatorType::KN_CLAMP_OP: {
+        size_t guid, guidO;
+        jop.at("input_tensors")[0].at("guid").get_to(guid);
+        jop.at("output_tensors")[0].at("guid").get_to(guidO);
+        DTensor const &output =
+            g.elementunary_clamp(get_tensor_from_guid(guid),
+                                 type::CLAMP_MIN_MAX["min_val"],
+                                 type::CLAMP_MIN_MAX["max_val"]);
         guid_mapping[output.guid] = guidO;
         break;
       }
